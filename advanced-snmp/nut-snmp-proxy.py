@@ -8,6 +8,7 @@ import sys
 import subprocess
 import time
 import logging
+import argparse # Import argparse
 
 # --- Configuration ---
 # The OID base we are responsible for. snmpd will send us requests for OIDs
@@ -18,8 +19,23 @@ BASE_OID = ".1.3.6.1.2.1.33"
 # We use @localhost to ensure we're talking to the local daemon.
 NUT_UPS_NAME = "nutdev1@localhost"
 
+# --- Argument Parsing ---
+parser = argparse.ArgumentParser(description="NUT to SNMP MIB Proxy Agent")
+parser.add_argument(
+    "--debug",
+    action="store_true",
+    help="Enable DEBUG logging"
+)
+args = parser.parse_args()
+
+# --- Logging Setup ---
+# Set default log level
+log_level = logging.INFO
+if args.debug:
+    log_level = logging.DEBUG
+
 # Set up logging to stderr. snmpd will redirect this to /var/log/syslog
-logging.basicConfig(stream=sys.stderr, level=logging.INFO, 
+logging.basicConfig(stream=sys.stderr, level=log_level, 
                     format='[nut-snmp-proxy] %(levelname)s: %(message)s')
 
 def get_upsc_value(var):
@@ -102,20 +118,25 @@ def print_snmp_response(oid, snmp_type, value):
 def handle_get(oid):
     """Handles a GET request for a specific OID."""
     if oid not in OID_MAP:
+        logging.debug(f"handle_get: OID {oid} not in OID_MAP.")
         print("NONE") # SNMP "no such object"
         return
 
     var, snmp_type, *converter = OID_MAP[oid]
+    logging.debug(f"handle_get: Found var {var} for OID {oid}.")
     
     value = get_upsc_value(var)
     if value is None:
+        logging.debug(f"handle_get: get_upsc_value returned NONE for {var}.")
         print("NONE")
         return
 
     try:
         if converter:
+            logging.debug(f"handle_get: Applying converter to {value}")
             value = converter[0](value) # Apply conversion function if it exists
         
+        logging.debug(f"handle_get: Responding with type={snmp_type}, value={value}")
         print_snmp_response(oid, snmp_type, value)
     except Exception as e:
         logging.error(f"Error processing value for {oid} ({var}): {e}")
@@ -126,18 +147,43 @@ def handle_getnext(oid):
     Handles a GETNEXT request.
     Finds the next OID in our sorted list that is *after* the requested one.
     """
+    logging.debug(f"Handling GETNEXT for OID: {oid}")
+    try:
+        t_oid = oid_to_tuple(oid)
+    except Exception as e:
+        logging.error(f"Failed to convert requested OID {oid} to tuple: {e}")
+        print("NONE")
+        return
+        
+    logging.debug(f"Converted OID to tuple: {t_oid}")
+
     for i, current_oid in enumerate(SORTED_OIDS):
+        try:
+            t_current = oid_to_tuple(current_oid)
+        except Exception as e:
+            logging.error(f"Failed to convert internal OID {current_oid} to tuple: {e}")
+            continue # Skip this OID
+
+        logging.debug(f"Checking against: {t_current} (from {current_oid})")
+        
         # Find the first OID that is numerically greater than the one requested
-        if oid_to_tuple(current_oid) > oid_to_tuple(oid):
+        if t_current > t_oid:
+            logging.debug(f"Found next OID: {current_oid}")
             handle_get(current_oid) # Handle GET for this "next" OID
             return
+        else:
+            logging.debug(f"OID {t_current} is not > {t_oid}")
             
     # If we loop and find nothing, we are at the end of our MIB
+    logging.debug("No next OID found, returning NONE.")
     print("NONE")
 
 def oid_to_tuple(oid_str):
     """Converts a dotted OID string to a tuple of integers for easy comparison."""
-    return tuple(map(int, oid_str.strip('.').split('.')))
+    # .split('.') on a leading-dot OID produces an empty string, e.g., ['.1','2'] -> ['', '1', '2']
+    # We filter out this empty string.
+    parts = oid_str.split('.')
+    return tuple(map(int, filter(None, parts)))
 
 def main_loop():
     """Main loop, listening to stdin for requests from snmpd."""
@@ -152,23 +198,23 @@ def main_loop():
                 # If stdin is not closed, it might be an empty line, just continue
                 time.sleep(0.1)
                 continue
-
+            
+            logging.debug(f"Received command: {line}")
             command = line.lower()
 
-            if command == "ping":
-                print("PONG")
-            elif command.startswith("get"):
-                _, oid = line.split()
-                handle_get(oid)
-            elif command.startswith("getnext"):
+            # --- FIX: Check for 'getnext' first! ---
+            if command.startswith("getnext"):
                 _, oid = line.split()
                 # Start searching from the OID requested.
                 # If the OID is *in* our MIB, we must return the *next* one.
                 # If the OID is *before* our MIB, we return the *first* one.
-                if oid_to_tuple(oid) < oid_to_tuple(SORTED_OIDS[0]):
-                    handle_get(SORTED_OIDS[0])
-                else:
-                    handle_getnext(oid)
+                # The handle_getnext() function already does all this logic.
+                handle_getnext(oid)
+            elif command.startswith("get"):
+                _, oid = line.split()
+                handle_get(oid)
+            elif command == "ping":
+                print("PONG")
             else:
                 logging.warning(f"Received unknown command: {line}")
 
