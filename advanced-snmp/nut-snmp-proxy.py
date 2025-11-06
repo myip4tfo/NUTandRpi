@@ -3,7 +3,7 @@
 # NUT to Standard UPS-MIB (RFC 1628) Standalone SNMP Agent
 #
 # This script is a self-contained SNMPv3 agent that uses the PySNMP library.
-# It requires a modern PySNMP version (5.x+) and Python 3.8+ to run.
+# It is designed to be compatible with modern PySNMP versions (5.x+) and Python 3.8+.
 # It dynamically responds to SNMP GET/GETNEXT queries for UPS-MIB OIDs
 # by fetching the corresponding data from the NUT `upsc` command.
 
@@ -19,11 +19,12 @@ try:
     from pysnmp.entity import engine, config
     from pysnmp.entity.rfc3413 import cmdrsp, context
     from pysnmp.carrier.asyncio.dgram import udp
-    from pysnmp.smi import builder, instrum
-    # MibScalarInstance has been moved in modern PySNMP
+    from pysnmp.smi import builder, instrum, rfc1902
+
+    # In modern PySNMP (5.x+), MibScalarInstance is located in the rfc1902 module.
+    # This is consistent with the deprecation warnings observed.
     from pysnmp.smi.rfc1902 import MibScalarInstance
 
-    # --- PySNMP Data Type Imports (for modern PySNMP) ---
     # The base ASN.1 types like OctetString are in the `pyasn1` dependency.
     from pyasn1.type import univ
 
@@ -35,8 +36,6 @@ except ImportError as e:
 
 
 # --- MIB Builder Setup and Symbol Loading ---
-# We need to build the MIB and load the necessary SNMP types *before* we can
-# use them in the OID map.
 mib_builder = builder.MibBuilder()
 (
     Integer32,
@@ -49,7 +48,7 @@ mib_builder = builder.MibBuilder()
 
 # --- Agent Configuration ---
 NUT_UPS_NAME = "nutdev1@localhost"
-AGENT_VERSION = "2.1.0" # Updated version
+AGENT_VERSION = "2.3.0" # Updated version
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -109,8 +108,6 @@ def convert_status_to_mib_integer(status_string):
     return 1  # unknown
 
 # --- OID to NUT Variable Mapping ---
-# This dictionary maps the SNMP OID to a tuple containing:
-# ( nut_variable_name, snmp_data_type_class, [optional_conversion_function] )
 OID_TO_NUT_MAP = {
     # upsIdent group
     "1.3.6.1.2.1.33.1.1.1.0": ("device.mfr", univ.OctetString),
@@ -132,27 +129,20 @@ OID_TO_NUT_MAP = {
 def create_mib_scalar_instance(nut_variable, snmp_syntax, converter=None):
     """
     A class factory that creates a MibScalarInstance subclass for a given NUT variable.
-    This avoids repetitive class definitions for each OID.
     """
     class NutMibScalar(MibScalarInstance):
         def getValue(self, name, idx):
-            # This method is called by the PySNMP engine when a GET/GETNEXT request arrives.
             raw_value = get_upsc_value(nut_variable)
 
-            # If upsc fails, we must return a valid object of the expected type (syntax).
             if raw_value is None:
                 log.warning(f"Returning default value for {nut_variable} as upsc fetch failed.")
-                # Return empty string for OctetString, 0 for numeric types.
                 return self.syntax.clone('' if issubclass(self.syntax.__class__, univ.OctetString) else 0)
 
             try:
-                # Apply the converter function if one is defined for this OID.
                 final_value = converter(raw_value) if converter else raw_value
-                # Cast to the final PySNMP object type and return it.
                 return self.syntax.clone(final_value)
             except (ValueError, TypeError) as e:
                 log.error(f"Failed to process value '{raw_value}' for {nut_variable}. Error: {e}")
-                # Return a default value on processing failure.
                 return self.syntax.clone('' if issubclass(self.syntax.__class__, univ.OctetString) else 0)
 
     return NutMibScalar
@@ -180,7 +170,7 @@ async def main():
     # --- Configure SNMPv3 User Security Model (USM) ---
     config.add_v3_user(
         snmp_engine,
-        userName=args.snmp_user,
+        args.snmp_user,
         authProtocol=config.USM_AUTH_HMAC96_SHA,
         authKey=args.auth_key,
         privProtocol=config.USM_PRIV_CFB128_AES,
@@ -188,49 +178,38 @@ async def main():
     )
 
     # --- Configure Network Transport ---
-    # Listen on the specified IP address and port.
     listen_address = (args.agent_address, args.agent_port)
     config.add_transport(
         snmp_engine,
-        udp.DOMAIN_NAME,  # The transport domain for UDP
+        udp.DOMAIN_NAME,
         udp.UdpTransport().open_server_mode(listen_address)
     )
 
     # --- Build the MIB and Register OIDs ---
-    # MibInstrumController links the MIB to live data sources.
     mib_instrum = instrum.MibInstrumController(mib_builder)
 
-    # Dynamically create and register a MibScalarInstance for each OID in our map.
     for oid_str, (nut_var, snmp_class, *converter_func) in OID_TO_NUT_MAP.items():
         oid_tuple = tuple(int(x) for x in oid_str.split('.'))
         converter = converter_func[0] if converter_func else None
-
-        # Create the specialized class for this OID using our factory.
         ScalarInstanceClass = create_mib_scalar_instance(nut_var, snmp_class(), converter)
-
-        # Register this new class with the MIB instrumentation controller.
         mib_builder.export_symbols(
-            '__LOCAL_NUT_MIB',  # An arbitrary, internal MIB name
+            '__LOCAL_NUT_MIB',
             ScalarInstanceClass(oid_tuple, snmp_class())
         )
 
     # --- Register Command Responders and MIB View ---
-    # These responders handle incoming GET, GETNEXT, and GETBULK requests.
-    cmdrsp.GetCommandResponder(snmp_engine, context.SnmpContext(snmp_engine))
-    cmdrsp.NextCommandResponder(snmp_engine, context.SnmpContext(snmp_engine))
-    cmdrsp.BulkCommandResponder(snmp_engine, context.SnmpContext(snmp_engine))
-
-    # Link the MIB instrumentation to the default SNMP context.
-    config.add_context(snmp_engine, '', mib_instrum)
+    snmp_context = context.SnmpContext(snmp_engine, mib_instrum)
+    cmdrsp.GetCommandResponder(snmp_engine, snmp_context)
+    cmdrsp.NextCommandResponder(snmp_engine, snmp_context)
+    cmdrsp.BulkCommandResponder(snmp_engine, snmp_context)
 
     # --- Start the Agent ---
     log.info(f"Agent starting. Listening on udp:{args.agent_address}:{args.agent_port}")
     log.info(f"Configured for SNMPv3 user: '{args.snmp_user}'")
 
-    snmp_engine.transportDispatcher.job_started(1)  # Signal that the engine is ready.
+    snmp_engine.transportDispatcher.job_started(1)
 
     try:
-        # Run the asyncio event loop forever.
         await asyncio.Event().wait()
     except (KeyboardInterrupt, asyncio.CancelledError):
         log.info("Shutdown signal received.")
@@ -244,5 +223,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except Exception as e:
-        log.critical(f"A critical error occurred in the main event loop: {e}")
+        log.critical(f"A critical error occurred in the main event loop: {e}", exc_info=True)
         sys.exit(1)
