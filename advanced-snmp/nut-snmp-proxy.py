@@ -12,11 +12,12 @@ import asyncio
 try:
     from pysnmp.entity import engine, config
     from pysnmp.entity.rfc3413 import cmdrsp, context
-    # Use the asyncio carrier, not the old asyncore one
     from pysnmp.carrier.asyncio.dgram import udp
     from pysnmp.smi import builder, instrum, rfc1902
+    # Import the `univ` module from pyasn1 for base ASN.1 types
+    from pyasn1.type import univ
 except ImportError as e:
-    print(f"Error: Failed to import pysnmp library: {e}", file=sys.stderr)
+    print(f"Error: Failed to import pysnmp or pyasn1 library: {e}", file=sys.stderr)
     print("Please ensure pysnmp is installed in the virtual environment.", file=sys.stderr)
     sys.exit(1)
 
@@ -77,8 +78,9 @@ OID_MAP = {
     "1.3.6.1.2.1.33.1.4.4.1.5.1": ("ups.load", "GAUGE"),
 }
 
+# Correct mapping for modern pysnmp/pyasn1
 SNMP_TYPE_MAP = {
-    'STRING': rfc1902.OctetString,
+    'STRING': univ.OctetString,
     'INTEGER': rfc1902.Integer32,
     'GAUGE': rfc1902.Gauge32,
 }
@@ -90,13 +92,14 @@ def make_mib_scalar_instance(nut_var, snmp_type_class, converter=None):
             raw_value = get_upsc_value(nut_var)
             if raw_value is None:
                 logging.warning(f"Returning default value for {nut_var} as upsc fetch failed.")
-                return self.syntax.clone(0 if self.syntax.isSuperTypeOf(rfc1902.Integer32(0)) else "")
+                # For strings, return empty string, otherwise 0.
+                return self.syntax.clone("" if issubclass(self.syntax.__class__, univ.OctetString) else 0)
             try:
                 processed_value = converter(raw_value) if converter else raw_value
                 return self.syntax.clone(processed_value)
             except Exception as e:
                 logging.error(f"Failed to process value '{raw_value}' for {nut_var}: {e}")
-                return self.syntax.clone(0 if self.syntax.isSuperTypeOf(rfc1902.Integer32(0)) else "")
+                return self.syntax.clone("" if issubclass(self.syntax.__class__, univ.OctetString) else 0)
     return MibScalar
 
 async def main():
@@ -126,13 +129,11 @@ async def main():
 
     # --- Transport Endpoint ---
     listen_address = (args.agent_address, args.agent_port)
-    transport = udp.UdpTransport()
-    snmp_engine.registerTransportDispatcher(transport)
-
+    # The pysnmp engine will use the asyncio event loop by default
     config.addTransport(
         snmp_engine,
         udp.domainName,
-        transport.openServerMode(listen_address)
+        udp.UdpTransport().openServerMode(listen_address)
     )
 
     # --- MIB and Instrumentation Setup ---
@@ -157,9 +158,9 @@ async def main():
     snmp_engine.transportDispatcher.jobStarted(1)  # Mark dispatcher as active
 
     try:
-        # Create a future that never completes, keeping the loop alive
-        await asyncio.Future()
-    except asyncio.CancelledError:
+        # Keep the script running
+        await asyncio.Event().wait()
+    except (KeyboardInterrupt, asyncio.CancelledError):
         logging.info("Shutdown request received.")
     finally:
         logging.info("Shutting down SNMP agent.")
