@@ -1,8 +1,5 @@
 #!/bin/bash
 
-# Exit immediately if a command exits with a non-zero status.
-set -e
-
 # --- This script will install a Python SNMP agent to spoof the standard UPS-MIB ---
 
 # Check if script is run as sudo/root
@@ -55,7 +52,7 @@ verify_permissions() {
         if [ -L "$symlink" ] && [[ "$(readlink "$symlink")" == *"$search_pattern"* ]]; then found_dev="/dev/$(basename "$symlink")"; break; fi
     done
     if [ -z "$found_dev" ]; then echo "WARNING: Could not find matching hidraw device." >&2; return 1; fi
-    echo "Found device at $found_dev. Permissions: $(stat -c "%a" "$found_dev"), Group: $(stat -c "%G" "$found_dev")"
+    echo "Found device at $found_dev. Permissions: $(stat -c "%a" "$found_dev")", Group: $(stat -c "%G" "$found_dev")""
     if [ "$(stat -c "%a" "$found_dev")" == "660" ] && [ "$(stat -c "%G" "$found_dev")" == "nut" ]; then echo "SUCCESS: Permissions are correct."; return 0; else echo "ERROR: Permissions are NOT correct."; return 1; fi
 }
 
