@@ -1,0 +1,14 @@
+[Unit]
+Description=NUT to SNMP MIB Proxy Agent
+After=network.target nut-server.service
+Requires=nut-server.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nut-snmp-proxy.py
+User=root
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
