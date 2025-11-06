@@ -196,19 +196,62 @@ else
     echo "Ok, we will NOT run 'apt update'";
 fi
 
-read -n 32 -p "Tell me what SNMP v2c community string I should use for your configuration: " v2ccommunity
-while [[ "$v2ccommunity" =~ [^a-zA-Z0-9] || -z "$v2ccommunity" ]]; do
-    echo "I cannot use that. Please only use alphanumeric characters. You can use 1-32 characters total"
-    read -n 32 -p "Tell me what SNMP v2c community string I should use for your configuration: " v2ccommunity
-done
-echo "" # Newline after read -n
+# --- SNMP Configuration Choice ---
+snmp_version=""
+while [[ "$snmp_version" != "v2c" && "$snmp_version" != "v3" ]]; do
+    read -p "Which SNMP version do you want to configure? (v2c/v3) [Default: v2c]: " snmp_choice
+    snmp_version=${snmp_choice:-v2c} # Default to v2c if empty
+    snmp_version=$(echo "$snmp_version" | tr '[:upper:]' '[:lower:]') # convert to lowercase
+    if [[ "$snmp_version" == "2c" ]]; then snmp_version="v2c"; fi
+    if [[ "$snmp_version" == "3" ]]; then snmp_version="v3"; fi
 
-# NEW: Prompt for UPS Name
+    if [[ "$snmp_version" != "v2c" && "$snmp_version" != "v3" ]]; then
+        echo "Invalid choice. Please enter 'v2c' or 'v3'."
+    fi
+done
+
+echo "Configuring for SNMP $snmp_version..."
+
+# Prompt for UPS Name (needed for both versions)
 read -p "Please enter a descriptive name for this UPS (e.g., 'Main Office UPS'): " ups_name
 while [[ -z "$ups_name" ]]; do
     echo "The UPS name cannot be empty."
     read -p "Please enter a descriptive name for this UPS: " ups_name
 done
+
+# Version-specific prompts
+if [ "$snmp_version" == "v2c" ]; then
+    read -n 32 -p "Tell me what SNMP v2c community string I should use for your configuration: " v2ccommunity
+    while [[ "$v2ccommunity" =~ [^a-zA-Z0-9] || -z "$v2ccommunity" ]]; do
+        echo "I cannot use that. Please only use alphanumeric characters. You can use 1-32 characters total"
+        read -n 32 -p "Tell me what SNMP v2c community string I should use for your configuration: " v2ccommunity
+    done
+    echo "" # Newline after read -n
+else
+    # SNMPv3 Prompts
+    read -p "Enter SNMPv3 Username: " v3_username
+    while [[ -z "$v3_username" ]]; do
+        echo "Username cannot be empty."
+        read -p "Enter SNMPv3 Username: " v3_username
+    done
+    
+    read -s -p "Enter SNMPv3 Authentication Password (min 8 chars): " v3_authpass
+    echo ""
+    while [[ ${#v3_authpass} -lt 8 ]]; do
+        echo "Password must be at least 8 characters."
+        read -s -p "Enter SNMPv3 Authentication Password (min 8 chars): " v3_authpass
+        echo ""
+    done
+    
+    read -s -p "Enter SNMPv3 Privacy/Encryption Password (min 8 chars): " v3_privpass
+    echo ""
+    while [[ ${#v3_privpass} -lt 8 ]]; do
+        echo "Password must be at least 8 characters."
+        read -s -p "Enter SNMPv3 Privacy/Encryption Password (min 8 chars): " v3_privpass
+        echo ""
+    done
+fi
+
 
 echo "*********************"
 
@@ -306,12 +349,27 @@ sudo apt-get install snmp snmpd libsnmp-dev snmp-mibs-downloader -y
 echo "Backing up snmpd.conf..."
 cp /etc/snmp/snmpd.conf /etc/snmp/old.snmpd.conf.old
 
-# overwrite snmpd.conf with this one  line
-echo "Configuring snmpd.conf..."
-# FIX: Corrected typo from $v2ccommnity to $v2ccommunity
-echo "rocommunity $v2ccommunity" > /etc/snmp/snmpd.conf
-# append the rest of the snmpd.conf to use upsc commands to capture variables
-# Using nutdev1@localhost for robustness
+# --- NEW SNMP Config Section ---
+echo "Configuring snmpd.conf for $snmp_version..."
+
+if [ "$snmp_version" == "v2c" ]; then
+    # v2c configuration (overwrites file)
+    echo "rocommunity $v2ccommunity" > /etc/snmp/snmpd.conf
+else
+    # v3 configuration (overwrites file)
+    echo "Stopping snmpd to create v3 user..."
+    systemctl stop snmpd
+    
+    # Create the v3 user. This line creates the user with SHA auth and AES privacy.
+    # This *replaces* any previous config.
+    echo "createUser $v3_username SHA \"$v3_authpass\" AES \"$v3_privpass\"" > /etc/snmp/snmpd.conf
+    
+    # Give the new user read-write access
+    echo "rwuser $v3_username authPriv" >> /etc/snmp/snmpd.conf
+fi
+
+# Append the rest of the snmpd.conf (same for v2c and v3)
+echo "Appending NUT OIDs to snmpd.conf..."
 echo 'extend-sh upsmodel "/bin/upsc nutdev1@localhost ups.model"' >> /etc/snmp/snmpd.conf
 echo 'extend-sh upsmfr "/bin/upsc nutdev1@localhost  ups.mfr"' >> /etc/snmp/snmpd.conf
 echo 'extend-sh upsserial "/bin/upsc nutdev1@localhost ups.serial"' >> /etc/snmp/snmpd.conf
@@ -323,7 +381,17 @@ echo 'extend-sh inputvolt "/bin/upsc nutdev1@localhost input.voltage"' >> /etc/s
 echo 'extend-sh inputHZ "/bin/upsc nutdev1@localhost input.frequency"' >> /etc/snmp/snmpd.conf
 echo 'extend-sh outputvolt "/bin/upsc nutdev1@localhost output.voltage"' >> /etc/snmp/snmpd.conf
 echo 'extend-sh outputHZ "/bin/upsc nutdev1@localhost output.frequency"' >> /etc/snmp/snmpd.conf
-echo 'extend-sh outputload "/bin/upsc nutdev1@localhost ups.power"' >> /etc/snmp/snmpd.conf
+echo 'extend-sh outputloadVA "/bin/upsc nutdev1@localhost ups.power"' >> /etc/snmp/snmpd.conf
+
+# --- NEW ITEMS ---
+echo 'extend-sh upsloadpercent "/bin/upsc nutdev1@localhost ups.load"' >> /etc/snmp/snmpd.conf
+echo 'extend-sh upsrealpowerW "/bin/upsc nutdev1@localhost ups.realpower"' >> /etc/snmp/snmpd.conf
+echo 'extend-sh inputcurrent "/bin/upsc nutdev1@localhost input.current"' >> /etc/snmp/snmpd.conf
+echo 'extend-sh outputcurrent "/bin/upsc nutdev1@localhost output.current"' >> /etc/snmp/snmpd.conf
+echo 'extend-sh upsfirmware "/bin/upsc nutdev1@localhost ups.firmware"' >> /etc/snmp/snmpd.conf
+echo 'extend-sh upstestresult "/bin/upsc nutdev1@localhost ups.test.result"' >> /etc/snmp/snmpd.conf
+# --- END NEW ITEMS ---
+
 
 # enable and restart snmpd
 echo "Enabling and restarting snmpd..."
@@ -332,12 +400,30 @@ systemctl restart snmpd
 # sleep for 20 seconds
 echo "Waiting for snmpd to start (20 seconds)..."
 sleep 20
+
+# --- NEW Conditional SNMP Test ---
 # run our snmptest
-echo "Running snmpget test..."
-snmpget -v2c -c "$v2ccommunity" localhost .1.3.6.1.4.1.8072.1.3.2.4.1.2.8.117.112.115.109.111.100.101.108.1 .1.3.6.1.4.1.8072.1.3.2.4.1.2.6.117.112.115.109.102.114.1 .1.3.6.1.4.1.8072.1.3.2.4.1.2.9.117.112.115.115.101.114.105.97.108.1 .1.3.6.1.4.1.8072.1.3.2.4.1.2.9.117.112.115.115.116.97.116.117.115.1 .1.3.6.1.4.1.8072.1.3.2.4.1.2.10.98.97.116.116.99.104.97.114.103.101.1 .1.3.6.1.4.1.8072.1.3.2.4.1.2.9.98.97.116.116.118.111.108.116.115.1 .1.3.6.1.4.1.8072.1.3.2.4.1.2.9.105.110.112.117.116.118.111.108.116.1 .1.3.6.1.4.1.8072.1.3.2.4.1.2.7.105.110.112.117.116.72.90.1 .1.3.6.1.4.1.8072.1.3.2.4.1.2.10.111.117.116.112.117.116.118.111.108.116.1 .1.3.6.1.4.1.8072.1.3.2.4.1.2.8.111.117.116.112.117.116.72.90.1 .1.3.6.1.4.1.8072.1.3.2.4.1.2.10.111.117.116.112.117.116.108.111.97.100.1 .1.3.6.1.4.1.8072.1.3.2.4.1.2.14.98.97.116.116.114.117.110.116.105.109.1E.101.115.116.1
+echo "Running snmpwalk test for $snmp_version..."
+
+# This is the base OID for the 'extend-sh' feature. Walking it is more robust.
+local base_oid=".1.3.6.1.4.1.8072.1.3.2.4.1.2"
+
+if [ "$snmp_version" == "v2c" ]; then
+    snmpwalk -v2c -c "$v2ccommunity" localhost $base_oid
+else
+    snmpwalk -v 3 -l authPriv -u "$v3_username" -a SHA -A "$v3_authpass" -x AES -X "$v3_privpass" localhost $base_oid
+fi
+
 # Be nice
 echo "---"
 echo "Done!"
 echo "You should now be able to see cool UPS stats at http://localhost/cgi-bin/nut/upsstats.cgi."
-echo "snmpwalk -v2c -c $v2ccommunity localhost .1.3.6.1.4.1.8072.1.3.2.4.1.2 should give you some SNMP data too."
+
+# Conditional final message
+if [ "$snmp_version" == "v2c" ]; then
+    echo "snmpwalk -v2c -c $v2ccommunity localhost $base_oid should give you all your UPS data."
+else
+    echo "snmpwalk -v 3 -l authPriv -u \"$v3_username\" -a SHA -A \"$v3_authpass\" -x AES -X \"$v3_privpass\" localhost $base_oid should give you all your UPS data."
+fi
+
 echo "This was fun. Thanks. Have a great day Internet Freind. Goodbye";
