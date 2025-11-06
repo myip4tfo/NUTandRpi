@@ -12,11 +12,9 @@ echo "Starting Advanced NUT SNMP MIB Proxy Installer..."
 # --- Configuration ---
 # Source files (expected in the same directory as this script)
 PROXY_SCRIPT_SOURCE="./nut-snmp-proxy.py"
-SERVICE_FILE_SOURCE="./nut-snmp-proxy.service"
 
 # Destination files
 PYTHON_AGENT_PATH="/usr/local/bin/nut-snmp-proxy.py"
-SYSTEMD_SERVICE_FILE="/etc/systemd/system/nut-snmp-proxy.service"
 
 UPS_MIB_BASE_OID=".1.3.6.1.2.1.33" # The base OID for the standard UPS-MIB
 UPS_CONF_NAME="nutdev1" # The name of the UPS in /etc/nut/ups.conf
@@ -176,11 +174,46 @@ verify_permissions() {
 }
 # --- (End Helper Functions) ---
 
+install_web_ui() {
+    echo "--- Installing Optional Web UI ---"
+    echo "Installing packages: apache2, nut-cgi..."
+    apt-get install apache2 nut-cgi -y
+    
+    echo "Enabling Apache CGI module..."
+    a2enmod cgi
+    
+    echo "Restarting Apache..."
+    systemctl restart apache2
+    sleep 3
+    
+    echo "Testing CGI (curl)..."
+    if curl -f http://localhost/cgi-bin/nut/upsstats.cgi; then
+        echo "Web UI seems to be working."
+    else
+        echo "Warning: Web UI test failed. http://localhost/cgi-bin/nut/upsstats.cgi"
+    fi
+    echo "--- Web UI Installation Complete ---"
+}
+
 
 # --- Main Script ---
+
+# --- Argument Parsing ---
+INSTALL_WEB_UI=false
+for arg in "$@"
+do
+    if [ "$arg" == "--install-web-ui" ]; then
+        INSTALL_WEB_UI=true
+    fi
+done
+
 echo "This advanced script will configure NUT and set up a Python proxy to"
 echo "map NUT data to the standard UPS-MIB ($UPS_MIB_BASE_OID)."
 echo "This will *overwrite* any existing snmpd.conf settings."
+echo ""
+echo "Optional: To also install the NUT web interface, run this script with:"
+echo "$0 --install-web-ui"
+echo ""
 read -p "Do you want to continue? (y/n) "
 if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     echo "Exiting."
@@ -191,6 +224,11 @@ fi
 echo "Installing packages: nut, snmpd, python3..."
 apt-get update -y
 apt-get install nut snmp snmpd libsnmp-dev python3 -y
+
+# Install Web UI if requested
+if [ "$INSTALL_WEB_UI" = true ]; then
+    install_web_ui
+fi
 
 # --- 2. Configure NUT (abbreviated, same as base script) ---
 echo "Configuring NUT..."
@@ -239,31 +277,6 @@ fi
 
 # --- 3. Install the Python Agent ---
 echo "Checking for proxy script at $PROXY_SCRIPT_SOURCE..."
-if [ ! -f "$PROXY_SCRIPT_SOURCE" ]; then
-    echo "ERROR: $PROXY_SCRIPT_SOURCE not found."
-    echo "Please make sure it is in the same directory as this script."
-    exit 1
-fi
-echo "Installing Python agent to $PYTHON_AGENT_PATH..."
-cp "$PROXY_SCRIPT_SOURCE" "$PYTHON_AGENT_PATH"
-chmod +x "$PYTHON_AGENT_PATH"
-echo "Python agent installed."
-
-# --- 4. Create systemd Service ---
-echo "Checking for service file at $SERVICE_FILE_SOURCE..."
-if [ ! -f "$SERVICE_FILE_SOURCE" ]; then
-    echo "ERROR: $SERVICE_FILE_SOURCE not found."
-    echo "Please make sure it is in the same directory as this script."
-    exit 1
-fi
-echo "Installing systemd service to $SYSTEMD_SERVICE_FILE..."
-cp "$SERVICE_FILE_SOURCE" "$SYSTEMD_SERVICE_FILE"
-
-echo "Reloading systemd and enabling proxy service..."
-systemctl daemon-reload
-systemctl enable nut-snmp-proxy.service
-systemctl restart nut-snmp-proxy.service
-echo "Service created and started."
 
 # --- 5. Configure snmpd.conf ---
 echo "Configuring snmpd.conf..."
@@ -278,12 +291,22 @@ echo "Stopping snmpd to configure..."
 systemctl stop snmpd
 
 # Overwrite snmpd.conf
-echo "createUser $v3_username SHA \"$v3_authpass\" AES \"$v3_privpass\"" > /etc/snmp/snmpd.conf
-echo "rwuser $v3_username authPriv" >> /etc/snmp/snmpd.conf
+cat > /etc/snmp/snmpd.conf << EOL
+# Listen for connections on all interfaces
+agentAddress udp:161,udp6:[::1]:161
 
-# Add the magic 'pass_persist' line
-echo "Adding proxy line to snmpd.conf..."
-echo "pass_persist $UPS_MIB_BASE_OID $PYTHON_AGENT_PATH" >> /etc/snmp/snmpd.conf
+# Create SNMPv3 user
+createUser $v3_username SHA "$v3_authpass" AES "$v3_privpass"
+
+# Define a view that includes the standard UPS MIB
+view upsview included $UPS_MIB_BASE_OID
+
+# Grant the user read-write access to the upsview
+rwuser $v3_username authPriv -V upsview
+
+# Add the magic 'pass_persist' line to proxy requests to our script
+pass_persist $UPS_MIB_BASE_OID $PYTHON_AGENT_PATH
+EOL
 
 echo "Restarting snmpd..."
 systemctl restart snmpd
@@ -295,4 +318,10 @@ echo "Installation complete!"
 echo "Your monitoring tool can now query this host using the standard UPS-MIB."
 echo "Run this command to test (replace with your credentials):"
 echo "snmpwalk -v 3 -l authPriv -u \"$v3_username\" -a SHA -A \"(your_auth_pass)\" -x AES -X \"(your_priv_pass)\" localhost $UPS_MIB_BASE_OID"
+
+if [ "$INSTALL_WEB_UI" = true ]; then
+    echo ""
+    echo "The web UI should be available at: http://<your_pi_ip>/cgi-bin/nut/upsstats.cgi"
+fi
+
 echo "---"
