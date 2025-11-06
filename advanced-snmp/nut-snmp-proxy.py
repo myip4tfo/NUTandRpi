@@ -3,7 +3,7 @@
 # NUT to Standard UPS-MIB (RFC 1628) Standalone SNMP Agent
 #
 # This script is a self-contained SNMPv3 agent that uses the PySNMP library.
-# It requires PySNMP 7.1+ and Python 3.8+ to run.
+# It requires a modern PySNMP version (5.x+) and Python 3.8+ to run.
 # It dynamically responds to SNMP GET/GETNEXT queries for UPS-MIB OIDs
 # by fetching the corresponding data from the NUT `upsc` command.
 
@@ -20,11 +20,12 @@ try:
     from pysnmp.entity.rfc3413 import cmdrsp, context
     from pysnmp.carrier.asyncio.dgram import udp
     from pysnmp.smi import builder, instrum
+    # MibScalarInstance has been moved in modern PySNMP
+    from pysnmp.smi.rfc1902 import MibScalarInstance
 
-    # --- PySNMP Data Type Imports (for modern PySNMP 7.1+) ---
+    # --- PySNMP Data Type Imports (for modern PySNMP) ---
     # The base ASN.1 types like OctetString are in the `pyasn1` dependency.
     from pyasn1.type import univ
-    # The specific SNMP application types are now located in the MIBs themselves.
 
 except ImportError as e:
     print(f"FATAL: A required library (PySNMP or PyASN1) is missing.", file=sys.stderr)
@@ -40,7 +41,7 @@ mib_builder = builder.MibBuilder()
 (
     Integer32,
     Gauge32,
-) = mib_builder.importSymbols(
+) = mib_builder.import_symbols(
     "SNMPv2-SMI",
     "Integer32",
     "Gauge32"
@@ -48,7 +49,7 @@ mib_builder = builder.MibBuilder()
 
 # --- Agent Configuration ---
 NUT_UPS_NAME = "nutdev1@localhost"
-AGENT_VERSION = "2.0.0"
+AGENT_VERSION = "2.1.0" # Updated version
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -133,7 +134,7 @@ def create_mib_scalar_instance(nut_variable, snmp_syntax, converter=None):
     A class factory that creates a MibScalarInstance subclass for a given NUT variable.
     This avoids repetitive class definitions for each OID.
     """
-    class NutMibScalar(instrum.MibScalarInstance):
+    class NutMibScalar(MibScalarInstance):
         def getValue(self, name, idx):
             # This method is called by the PySNMP engine when a GET/GETNEXT request arrives.
             raw_value = get_upsc_value(nut_variable)
@@ -177,27 +178,25 @@ async def main():
     snmp_engine = engine.SnmpEngine()
 
     # --- Configure SNMPv3 User Security Model (USM) ---
-    config.addV3User(
+    config.add_v3_user(
         snmp_engine,
         userName=args.snmp_user,
-        authProtocol=config.usmHMACSHAAuthProtocol,
+        authProtocol=config.USM_AUTH_HMAC96_SHA,
         authKey=args.auth_key,
-        privProtocol=config.usmAesCfb128Protocol,
+        privProtocol=config.USM_PRIV_CFB128_AES,
         privKey=args.priv_key,
     )
 
     # --- Configure Network Transport ---
     # Listen on the specified IP address and port.
     listen_address = (args.agent_address, args.agent_port)
-    config.addTransport(
+    config.add_transport(
         snmp_engine,
-        udp.domainName,  # The transport domain for UDP
-        udp.UdpTransport().openServerMode(listen_address)
+        udp.DOMAIN_NAME,  # The transport domain for UDP
+        udp.UdpTransport().open_server_mode(listen_address)
     )
 
     # --- Build the MIB and Register OIDs ---
-    # MibBuilder is the container for all MIB objects.
-    # The MibBuilder was already created at the global scope to load types.
     # MibInstrumController links the MIB to live data sources.
     mib_instrum = instrum.MibInstrumController(mib_builder)
 
@@ -210,7 +209,7 @@ async def main():
         ScalarInstanceClass = create_mib_scalar_instance(nut_var, snmp_class(), converter)
 
         # Register this new class with the MIB instrumentation controller.
-        mib_builder.exportSymbols(
+        mib_builder.export_symbols(
             '__LOCAL_NUT_MIB',  # An arbitrary, internal MIB name
             ScalarInstanceClass(oid_tuple, snmp_class())
         )
@@ -222,13 +221,13 @@ async def main():
     cmdrsp.BulkCommandResponder(snmp_engine, context.SnmpContext(snmp_engine))
 
     # Link the MIB instrumentation to the default SNMP context.
-    config.addContext(snmp_engine, '', mib_instrum)
+    config.add_context(snmp_engine, '', mib_instrum)
 
     # --- Start the Agent ---
     log.info(f"Agent starting. Listening on udp:{args.agent_address}:{args.agent_port}")
     log.info(f"Configured for SNMPv3 user: '{args.snmp_user}'")
 
-    snmp_engine.transportDispatcher.jobStarted(1)  # Signal that the engine is ready.
+    snmp_engine.transportDispatcher.job_started(1)  # Signal that the engine is ready.
 
     try:
         # Run the asyncio event loop forever.
@@ -237,7 +236,7 @@ async def main():
         log.info("Shutdown signal received.")
     finally:
         log.info("Shutting down agent...")
-        snmp_engine.transportDispatcher.closeDispatcher()
+        snmp_engine.transportDispatcher.close_dispatcher()
         log.info("Agent stopped.")
 
 
