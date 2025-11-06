@@ -9,7 +9,6 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # --- Configuration ---
-# Determine the script's own directory to reliably find the python script
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 AGENT_INSTALL_DIR="/opt/nut-snmp-proxy"
 PROXY_SCRIPT_SOURCE="$SCRIPT_DIR/nut-snmp-proxy.py"
@@ -17,7 +16,19 @@ PYTHON_AGENT_PATH="$AGENT_INSTALL_DIR/nut-snmp-proxy.py"
 AGENT_SERVICE_FILE="/etc/systemd/system/nut-snmp-agent.service"
 UPS_MIB_BASE_OID=".1.3.6.1.2.1.33"
 
-# --- (Helper Functions are unchanged) ---
+# --- Helper Functions ---
+countdown() {
+    local seconds=$1
+    local message=${2:-"Waiting"}
+    while [ $seconds -gt 0 ]; do
+        # Use \r to return to the beginning of the line and \033[0K to clear the rest
+        echo -ne "$message... $seconds\033[0K\r"
+        sleep 1
+        : $((seconds--))
+    done
+    echo "" # Print a newline to move to the next line after countdown finishes
+}
+
 select_ups_device() {
     echo "Looking for connected USB devices..." >&2; echo "" >&2
     mapfile -t devices < <(lsusb | sed 's/:\s*/:/g')
@@ -34,6 +45,7 @@ select_ups_device() {
         echo "Could not parse Vendor/Product ID." >&2; return 1
     fi
 }
+
 create_udev_rule() {
     local idVendor=$1; local idProduct=$2
     local rule_file="/etc/udev/rules.d/50-nut-ups.rules"
@@ -42,6 +54,7 @@ create_udev_rule() {
     if [ -f "$rule_file" ] && grep -qFx -- "$udev_rule" "$rule_file"; then echo "Rule already exists."; else echo "Adding rule to $rule_file..."; echo "$udev_rule" >> "$rule_file"; fi
     udevadm control --reload-rules && udevadm trigger && udevadm settle
 }
+
 verify_permissions() {
     local idVendor=$1; local idProduct=$2; local retries=10
     while [ $retries -gt 0 ] && ! ls /sys/class/hidraw/hidraw* &>/dev/null; do sleep 1; ((retries--)); done
@@ -70,7 +83,6 @@ apt-get install -y nut python3 python3-venv
 # --- 2. Configure NUT (abbreviated) ---
 echo "--- Step 2: Configuring NUT ---"
 echo "MODE=netserver" > "/etc/nut/nut.conf"
-# A simple attempt to auto-configure; user can modify this later
 if ! nut-scanner -UNq 2>/dev/null > /etc/nut/ups.conf || [ ! -s /etc/nut/ups.conf ]; then
     echo "[nutdev1]" > "/etc/nut/ups.conf"
     echo "    driver=usbhid-ups" >> "/etc/nut/ups.conf"
@@ -80,7 +92,14 @@ echo "--- Current /etc/nut/ups.conf ---"; cat /etc/nut/ups.conf; echo "---------
 read -r idVendor idProduct < <(select_ups_device)
 if [ -z "$idVendor" ] || [ -z "$idProduct" ]; then echo "Could not get Vendor/Product ID. Exiting."; exit 1; fi
 create_udev_rule "$idVendor" "$idProduct" && verify_permissions "$idVendor" "$idProduct"
-systemctl restart nut-driver.target; sleep 5; systemctl restart nut-server.service; sleep 5
+
+echo "Restarting NUT driver..."
+systemctl restart nut-driver.target
+countdown 5 "Pausing to allow driver to initialize"
+
+echo "Restarting NUT server..."
+systemctl restart nut-server.service
+countdown 5 "Pausing to allow server to initialize"
 
 # --- 3. Install the Python Agent and Virtual Environment ---
 echo "--- Step 3: Setting up Python Virtual Environment ---"

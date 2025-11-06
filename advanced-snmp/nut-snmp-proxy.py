@@ -25,7 +25,6 @@ try:
     # The base ASN.1 types like OctetString are in the `pyasn1` dependency.
     from pyasn1.type import univ
     # The specific SNMP application types are now located in the MIBs themselves.
-    from pysnmp.smi.mibs.SNMPv2_SMI import Integer32, Gauge32
 
 except ImportError as e:
     print(f"FATAL: A required library (PySNMP or PyASN1) is missing.", file=sys.stderr)
@@ -33,6 +32,19 @@ except ImportError as e:
     print("Please ensure pysnmp is installed in the script's Python environment.", file=sys.stderr)
     sys.exit(1)
 
+
+# --- MIB Builder Setup and Symbol Loading ---
+# We need to build the MIB and load the necessary SNMP types *before* we can
+# use them in the OID map.
+mib_builder = builder.MibBuilder()
+(
+    Integer32,
+    Gauge32,
+) = mib_builder.importSymbols(
+    "SNMPv2-SMI",
+    "Integer32",
+    "Gauge32"
+)
 
 # --- Agent Configuration ---
 NUT_UPS_NAME = "nutdev1@localhost"
@@ -185,8 +197,8 @@ async def main():
 
     # --- Build the MIB and Register OIDs ---
     # MibBuilder is the container for all MIB objects.
+    # The MibBuilder was already created at the global scope to load types.
     # MibInstrumController links the MIB to live data sources.
-    mib_builder = builder.MibBuilder()
     mib_instrum = instrum.MibInstrumController(mib_builder)
 
     # Dynamically create and register a MibScalarInstance for each OID in our map.
