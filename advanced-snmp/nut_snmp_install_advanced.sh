@@ -10,8 +10,9 @@ fi
 echo "Starting Advanced NUT SNMP MIB Standalone Agent Installer..."
 
 # --- Configuration ---
-PROXY_SCRIPT_SOURCE="./nut-snmp-proxy.py"
-PYTHON_AGENT_PATH="/usr/local/bin/nut-snmp-proxy.py"
+AGENT_INSTALL_DIR="/opt/nut-snmp-proxy"
+PROXY_SCRIPT_SOURCE="./nut-snmp-proxy.py" # Assumes this script is run from the advanced-snmp dir
+PYTHON_AGENT_PATH="$AGENT_INSTALL_DIR/nut-snmp-proxy.py"
 AGENT_SERVICE_FILE="/etc/systemd/system/nut-snmp-agent.service"
 UPS_MIB_BASE_OID=".1.3.6.1.2.1.33"
 UPS_CONF_NAME="nutdev1"
@@ -60,12 +61,9 @@ read -p "This will install a standalone Python SNMP agent for NUT. This may conf
 if [[ ! $REPLY =~ ^[Yy]$ ]]; then echo "Exiting."; exit; fi
 
 # --- 1. Install Dependencies ---
-echo "Installing packages: nut, python3, python3-pip..."
+echo "Installing packages: nut, python3, python3-venv..."
 apt-get update -y
-apt-get install -y nut python3 python3-pip
-
-echo "Installing Python dependencies (pysnmp)..."
-pip3 install pysnmp
+apt-get install -y nut python3 python3-venv
 
 # --- 2. Configure NUT (abbreviated) ---
 echo "Configuring NUT..."
@@ -82,10 +80,17 @@ if [ -z "$idVendor" ] || [ -z "$idProduct" ]; then echo "Could not get Vendor/Pr
 create_udev_rule "$idVendor" "$idProduct" && verify_permissions "$idVendor" "$idProduct"
 systemctl restart nut-driver.target; sleep 10; systemctl restart nut-server.service; sleep 10
 
-# --- 3. Install the Python Agent ---
+# --- 3. Install the Python Agent and Virtual Environment ---
+echo "Creating agent directory and virtual environment at $AGENT_INSTALL_DIR..."
+mkdir -p "$AGENT_INSTALL_DIR"
+python3 -m venv "$AGENT_INSTALL_DIR/venv"
+
 echo "Installing Python agent script to $PYTHON_AGENT_PATH..."
 cp "$PROXY_SCRIPT_SOURCE" "$PYTHON_AGENT_PATH"
 chmod +x "$PYTHON_AGENT_PATH"
+
+echo "Installing Python dependencies (pysnmp) into virtual environment..."
+"$AGENT_INSTALL_DIR/venv/bin/pip" install pysnmp
 
 # --- 4. Configure and Start Standalone Agent Service ---
 echo "Configuring the standalone SNMP agent service..."
@@ -105,7 +110,7 @@ Requires=nut-server.service
 [Service]
 Type=simple
 User=root
-ExecStart=$PYTHON_AGENT_PATH --snmp-user "$v3_username" --auth-key "$v3_authpass" --priv-key "$v3_privpass"
+ExecStart=$AGENT_INSTALL_DIR/venv/bin/python $PYTHON_AGENT_PATH --snmp-user "$v3_username" --auth-key "$v3_authpass" --priv-key "$v3_privpass"
 Restart=on-failure
 RestartSec=5
 
