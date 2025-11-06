@@ -1,21 +1,24 @@
 #!/bin/bash
 
-# Check if script is run as sudo/root
-if [ "$EUID" -ne 0 ]; then
-    echo "ERROR script not run as root/sudo. Please run as root or using sudo"
-    exit
-fi
+# Exit immediately if a command exits with a non-zero status.
+set -e
 
 # --- This script will install a Python SNMP agent to spoof the standard UPS-MIB ---
-echo "Starting Advanced NUT SNMP MIB Standalone Agent Installer..."
+
+# Check if script is run as sudo/root
+if [ "$EUID" -ne 0 ]; then
+    echo "ERROR: This script must be run as root or with sudo."
+    exit 1
+fi
 
 # --- Configuration ---
+# Determine the script's own directory to reliably find the python script
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 AGENT_INSTALL_DIR="/opt/nut-snmp-proxy"
-PROXY_SCRIPT_SOURCE="./nut-snmp-proxy.py" # Assumes this script is run from the advanced-snmp dir
+PROXY_SCRIPT_SOURCE="$SCRIPT_DIR/nut-snmp-proxy.py"
 PYTHON_AGENT_PATH="$AGENT_INSTALL_DIR/nut-snmp-proxy.py"
 AGENT_SERVICE_FILE="/etc/systemd/system/nut-snmp-agent.service"
 UPS_MIB_BASE_OID=".1.3.6.1.2.1.33"
-UPS_CONF_NAME="nutdev1"
 
 # --- (Helper Functions are unchanged) ---
 select_ups_device() {
@@ -57,20 +60,22 @@ verify_permissions() {
 }
 
 # --- Main Script ---
+echo "Starting Advanced NUT SNMP MIB Standalone Agent Installer..."
 read -p "This will install a standalone Python SNMP agent for NUT. This may conflict with other services using port 161. Continue? (y/n) "
 if [[ ! $REPLY =~ ^[Yy]$ ]]; then echo "Exiting."; exit; fi
 
 # --- 1. Install Dependencies ---
+echo "--- Step 1: Installing System Dependencies ---"
 echo "Installing packages: nut, python3, python3-venv..."
 apt-get update -y
 apt-get install -y nut python3 python3-venv
 
 # --- 2. Configure NUT (abbreviated) ---
-echo "Configuring NUT..."
+echo "--- Step 2: Configuring NUT ---"
 echo "MODE=netserver" > "/etc/nut/nut.conf"
-nut-scanner -UNq 2>/dev/null > /etc/nut/ups.conf
-if [ $? -ne 0 ] || [ ! -s /etc/nut/ups.conf ]; then
-    echo "[$UPS_CONF_NAME]" > "/etc/nut/ups.conf"
+# A simple attempt to auto-configure; user can modify this later
+if ! nut-scanner -UNq 2>/dev/null > /etc/nut/ups.conf || [ ! -s /etc/nut/ups.conf ]; then
+    echo "[nutdev1]" > "/etc/nut/ups.conf"
     echo "    driver=usbhid-ups" >> "/etc/nut/ups.conf"
     echo "    port = auto" >> "/etc/nut/ups.conf"
 fi
@@ -78,22 +83,29 @@ echo "--- Current /etc/nut/ups.conf ---"; cat /etc/nut/ups.conf; echo "---------
 read -r idVendor idProduct < <(select_ups_device)
 if [ -z "$idVendor" ] || [ -z "$idProduct" ]; then echo "Could not get Vendor/Product ID. Exiting."; exit 1; fi
 create_udev_rule "$idVendor" "$idProduct" && verify_permissions "$idVendor" "$idProduct"
-systemctl restart nut-driver.target; sleep 10; systemctl restart nut-server.service; sleep 10
+systemctl restart nut-driver.target; sleep 5; systemctl restart nut-server.service; sleep 5
 
 # --- 3. Install the Python Agent and Virtual Environment ---
-echo "Creating agent directory and virtual environment at $AGENT_INSTALL_DIR..."
+echo "--- Step 3: Setting up Python Virtual Environment ---"
+
+echo "Creating clean agent directory and virtual environment at $AGENT_INSTALL_DIR..."
+rm -rf "$AGENT_INSTALL_DIR"
 mkdir -p "$AGENT_INSTALL_DIR"
 python3 -m venv "$AGENT_INSTALL_DIR/venv"
 
-echo "Installing Python agent script to $PYTHON_AGENT_PATH..."
+echo "Copying Python agent script to $PYTHON_AGENT_PATH..."
 cp "$PROXY_SCRIPT_SOURCE" "$PYTHON_AGENT_PATH"
 chmod +x "$PYTHON_AGENT_PATH"
 
-echo "Installing Python dependencies (pysnmp) into virtual environment..."
-"$AGENT_INSTALL_DIR/venv/bin/pip" install pysnmp
+echo "Installing Python dependencies (pysnmp>=7.1) into virtual environment..."
+# Use the pip from the virtual environment to install packages into it.
+"$AGENT_INSTALL_DIR/venv/bin/pip" install "pysnmp>=7.1" || {
+    echo "ERROR: Failed to install pysnmp library into the virtual environment."
+    exit 1
+}
 
 # --- 4. Configure and Start Standalone Agent Service ---
-echo "Configuring the standalone SNMP agent service..."
+echo "--- Step 4: Configuring and Starting systemd Service ---"
 read -p "Enter SNMPv3 Username: " v3_username
 read -s -p "Enter SNMPv3 Authentication Password (min 8 chars): " v3_authpass
 echo ""
@@ -110,6 +122,7 @@ Requires=nut-server.service
 [Service]
 Type=simple
 User=root
+# Execute the script using the python interpreter from the virtual environment
 ExecStart=$AGENT_INSTALL_DIR/venv/bin/python $PYTHON_AGENT_PATH --snmp-user "$v3_username" --auth-key "$v3_authpass" --priv-key "$v3_privpass"
 Restart=on-failure
 RestartSec=5
@@ -124,9 +137,11 @@ systemctl enable $AGENT_SERVICE_FILE
 systemctl restart nut-snmp-agent
 
 # --- 5. Test ---
-echo "---"
-echo "Installation complete! The standalone Python agent should be running."
-echo "NOTE: This agent runs on port 161. If you were running the system snmpd, it has NOT been disabled."
-echo "Run this command to test:"
+echo "--- Step 5: Installation Complete! ---"
+echo "The standalone Python agent should now be running."
+echo "To check its status, run: systemctl status nut-snmp-agent"
+echo "To see its logs, run: journalctl -u nut-snmp-agent -f"
+echo ""
+echo "Run this command to test your new SNMP agent:"
 echo "snmpwalk -v 3 -l authPriv -u \"$v3_username\" -a SHA -A \"$v3_authpass\" -x AES -X \"$v3_privpass\" localhost $UPS_MIB_BASE_OID"
-echo "---"
+echo "--------------------------------------"

@@ -1,124 +1,170 @@
 #!/usr/bin/env python3
 
 # NUT to Standard UPS-MIB (RFC 1628) Standalone SNMP Agent
-# This script runs as a standalone SNMP agent using pysnmp and asyncio.
+#
+# This script is a self-contained SNMPv3 agent that uses the PySNMP library.
+# It requires PySNMP 7.1+ and Python 3.8+ to run.
+# It dynamically responds to SNMP GET/GETNEXT queries for UPS-MIB OIDs
+# by fetching the corresponding data from the NUT `upsc` command.
 
+# --- Standard Library Imports ---
 import sys
 import subprocess
 import logging
 import argparse
 import asyncio
 
+# --- PySNMP Core Imports ---
 try:
     from pysnmp.entity import engine, config
     from pysnmp.entity.rfc3413 import cmdrsp, context
     from pysnmp.carrier.asyncio.dgram import udp
     from pysnmp.smi import builder, instrum
-    # Import the `univ` module from pyasn1 for base ASN.1 types
+
+    # --- PySNMP Data Type Imports (for modern PySNMP 7.1+) ---
+    # The base ASN.1 types like OctetString are in the `pyasn1` dependency.
     from pyasn1.type import univ
-    # Import the specific SNMP data types from their new MIB location
+    # The specific SNMP application types are now located in the MIBs themselves.
     from pysnmp.smi.mibs.SNMPv2_SMI import Integer32, Gauge32
+
 except ImportError as e:
-    print(f"Error: Failed to import pysnmp or pyasn1 library: {e}", file=sys.stderr)
-    print("Please ensure pysnmp is installed in the virtual environment.", file=sys.stderr)
+    print(f"FATAL: A required library (PySNMP or PyASN1) is missing.", file=sys.stderr)
+    print(f"Error details: {e}", file=sys.stderr)
+    print("Please ensure pysnmp is installed in the script's Python environment.", file=sys.stderr)
     sys.exit(1)
 
-# --- Configuration ---
+
+# --- Agent Configuration ---
 NUT_UPS_NAME = "nutdev1@localhost"
+AGENT_VERSION = "2.0.0"
 
 # --- Logging Setup ---
-logging.basicConfig(stream=sys.stdout, level=logging.INFO,
-                    format='[%(asctime)s] [%(levelname)s] %(message)s')
+logging.basicConfig(
+    stream=sys.stdout,
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] (%(name)s) %(message)s'
+)
+log = logging.getLogger('NUT-SNMP-Agent')
 
-# --- Data Fetching ---
-def get_upsc_value(var):
+
+# --- Data Fetching Logic ---
+def get_upsc_value(variable_name):
     """
-    Runs upsc and returns the value for a given variable. Returns None on error.
+    Executes the `upsc` command to get a value from NUT.
+    Returns the string value on success, None on any failure.
     """
+    command = ['/bin/upsc', NUT_UPS_NAME, variable_name]
     try:
-        result = subprocess.run(['/bin/upsc', NUT_UPS_NAME, var],
-                                capture_output=True, text=True, timeout=5, check=True)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True
+        )
         value = result.stdout.strip()
         if value:
+            log.debug(f"upsc fetch for '{variable_name}': SUCCESS -> '{value}'")
             return value
         else:
-            logging.warning(f"upsc returned empty value for {var}")
+            log.warning(f"upsc fetch for '{variable_name}': returned an EMPTY value.")
             return None
-    except subprocess.CalledProcessError as e:
-        logging.debug(f"upsc failed for {var}: {e.stderr.strip()}")
-        return None
     except FileNotFoundError:
-        logging.error("Cannot find /bin/upsc. Ensure NUT is installed correctly.")
+        log.error(f"upsc command not found at '/bin/upsc'. Is NUT installed?")
+        return None
+    except subprocess.CalledProcessError as e:
+        # This is common if the UPS is not connected or the variable doesn't exist.
+        log.debug(f"upsc fetch for '{variable_name}': FAILED. Error: {e.stderr.strip()}")
         return None
     except Exception as e:
-        logging.error(f"Unhandled error running upsc for {var}: {e}")
+        log.error(f"An unexpected error occurred while running upsc for '{variable_name}': {e}")
         return None
 
-# --- Data Conversion ---
-def convert_status_to_int(status_str):
-    if "LB" in status_str: return 3  # batteryLow
-    if "OL" in status_str or "OB" in status_str: return 2  # batteryNormal
-    if "RB" in status_str or "BYPASS" in status_str: return 2
+# --- Data Type Conversion ---
+def convert_status_to_mib_integer(status_string):
+    """
+    Converts a NUT status string (e.g., "OL CHRG") into the corresponding
+    integer value required by the UPS-MIB `upsBatteryStatus` OID.
+    """
+    if "LB" in status_string:
+        return 3  # batteryLow
+    if "OL" in status_string or "OB" in status_string:
+        return 2  # batteryNormal
+    # Treat other states like "Replace Battery" (RB) or "Bypass" as normal for this value.
+    if "RB" in status_string or "BYPASS" in status_string:
+        return 2  # batteryNormal
     return 1  # unknown
 
-# --- OID Mapping ---
-OID_MAP = {
-    "1.3.6.1.2.1.33.1.1.1.0": ("device.mfr", "STRING"),
-    "1.3.6.1.2.1.33.1.1.2.0": ("device.model", "STRING"),
-    "1.3.6.1.2.1.33.1.1.5.0": ("device.serial", "STRING"),
-    "1.3.6.1.2.1.33.1.2.1.0": ("ups.status", "INTEGER", convert_status_to_int),
-    "1.3.6.1.2.1.33.1.2.2.0": ("battery.runtime", "INTEGER"),
-    "1.3.6.1.2.1.33.1.2.4.0": ("battery.charge", "GAUGE"),
-    "1.3.6.1.2.1.33.1.2.5.0": ("battery.voltage", "GAUGE", lambda x: int(float(x) * 10)),
-    "1.3.6.1.2.1.33.1.3.3.1.2.1": ("input.voltage", "GAUGE"),
-    "1.3.6.1.2.1.33.1.3.3.1.3.1": ("input.current", "GAUGE", lambda x: int(float(x) * 10)),
-    "1.3.6.1.2.1.33.1.3.3.1.4.1": ("input.frequency", "GAUGE", lambda x: int(float(x) * 10)),
-    "1.3.6.1.2.1.33.1.4.4.1.2.1": ("output.voltage", "GAUGE"),
-    "1.3.6.1.2.1.33.1.4.4.1.3.1": ("output.current", "GAUGE", lambda x: int(float(x) * 10)),
-    "1.3.6.1.2.1.33.1.4.4.1.4.1": ("ups.realpower", "INTEGER"),
-    "1.3.6.1.2.1.33.1.4.4.1.5.1": ("ups.load", "GAUGE"),
+# --- OID to NUT Variable Mapping ---
+# This dictionary maps the SNMP OID to a tuple containing:
+# ( nut_variable_name, snmp_data_type_class, [optional_conversion_function] )
+OID_TO_NUT_MAP = {
+    # upsIdent group
+    "1.3.6.1.2.1.33.1.1.1.0": ("device.mfr", univ.OctetString),
+    "1.3.6.1.2.1.33.1.1.2.0": ("device.model", univ.OctetString),
+    "1.3.6.1.2.1.33.1.1.5.0": ("device.serial", univ.OctetString),
+    # upsBattery group
+    "1.3.6.1.2.1.33.1.2.1.0": ("ups.status", Integer32, convert_status_to_mib_integer),
+    "1.3.6.1.2.1.33.1.2.2.0": ("battery.runtime", Integer32),
+    "1.3.6.1.2.1.33.1.2.4.0": ("battery.charge", Gauge32),
+    "1.3.6.1.2.1.33.1.2.5.0": ("battery.voltage", Gauge32, lambda v: int(float(v) * 10)),
+    # upsInput group
+    "1.3.6.1.2.1.33.1.3.3.1.2.1": ("input.voltage", Gauge32),
+    # upsOutput group
+    "1.3.6.1.2.1.33.1.4.4.1.2.1": ("output.voltage", Gauge32),
+    "1.3.6.1.2.1.33.1.4.4.1.5.1": ("ups.load", Gauge32),
 }
 
-# Correct mapping for modern pysnmp/pyasn1
-SNMP_TYPE_MAP = {
-    'STRING': univ.OctetString,
-    'INTEGER': Integer32,
-    'GAUGE': Gauge32,
-}
-
-# --- MIB Instrumentation ---
-def make_mib_scalar_instance(nut_var, snmp_type_class, converter=None):
-    class MibScalar(instrum.MibScalarInstance):
+# --- Dynamic MIB Instrumentation Class Factory ---
+def create_mib_scalar_instance(nut_variable, snmp_syntax, converter=None):
+    """
+    A class factory that creates a MibScalarInstance subclass for a given NUT variable.
+    This avoids repetitive class definitions for each OID.
+    """
+    class NutMibScalar(instrum.MibScalarInstance):
         def getValue(self, name, idx):
-            raw_value = get_upsc_value(nut_var)
+            # This method is called by the PySNMP engine when a GET/GETNEXT request arrives.
+            raw_value = get_upsc_value(nut_variable)
+
+            # If upsc fails, we must return a valid object of the expected type (syntax).
             if raw_value is None:
-                logging.warning(f"Returning default value for {nut_var} as upsc fetch failed.")
-                # For strings, return empty string, otherwise 0.
-                return self.syntax.clone("" if issubclass(self.syntax.__class__, univ.OctetString) else 0)
+                log.warning(f"Returning default value for {nut_variable} as upsc fetch failed.")
+                # Return empty string for OctetString, 0 for numeric types.
+                return self.syntax.clone('' if issubclass(self.syntax.__class__, univ.OctetString) else 0)
+
             try:
-                processed_value = converter(raw_value) if converter else raw_value
-                return self.syntax.clone(processed_value)
-            except Exception as e:
-                logging.error(f"Failed to process value '{raw_value}' for {nut_var}: {e}")
-                return self.syntax.clone("" if issubclass(self.syntax.__class__, univ.OctetString) else 0)
-    return MibScalar
+                # Apply the converter function if one is defined for this OID.
+                final_value = converter(raw_value) if converter else raw_value
+                # Cast to the final PySNMP object type and return it.
+                return self.syntax.clone(final_value)
+            except (ValueError, TypeError) as e:
+                log.error(f"Failed to process value '{raw_value}' for {nut_variable}. Error: {e}")
+                # Return a default value on processing failure.
+                return self.syntax.clone('' if issubclass(self.syntax.__class__, univ.OctetString) else 0)
+
+    return NutMibScalar
+
 
 async def main():
-    parser = argparse.ArgumentParser(description="NUT to SNMP MIB Standalone Agent")
-    parser.add_argument("--snmp-user", required=True, help="SNMPv3 username")
-    parser.add_argument("--auth-key", required=True, help="SNMPv3 authentication key")
-    parser.add_argument("--priv-key", required=True, help="SNMPv3 privacy key")
-    parser.add_argument("--agent-address", default="0.0.0.0", help="IP address to listen on")
-    parser.add_argument("--agent-port", type=int, default=161, help="Port to listen on")
-    parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging")
+    """The main entry point for the SNMP agent."""
+    # --- Argument Parsing ---
+    parser = argparse.ArgumentParser(description=f"NUT to SNMP MIB Standalone Agent (v{AGENT_VERSION})")
+    parser.add_argument("--snmp-user", required=True, help="SNMPv3 username for USM")
+    parser.add_argument("--auth-key", required=True, help="SNMPv3 authentication key (SHA, min 8 chars)")
+    parser.add_argument("--priv-key", required=True, help="SNMPv3 privacy (encryption) key (AES, min 8 chars)")
+    parser.add_argument("--agent-address", default="0.0.0.0", help="IP address to listen on (default: 0.0.0.0)")
+    parser.add_argument("--agent-port", type=int, default=161, help="UDP port to listen on (default: 161)")
+    parser.add_argument("--debug", action="store_true", help="Enable verbose DEBUG logging")
     args = parser.parse_args()
 
     if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+        log.setLevel(logging.DEBUG)
+        log.info("DEBUG logging enabled.")
 
+    # --- Initialize SNMP Engine ---
     snmp_engine = engine.SnmpEngine()
 
-    # --- SNMPv3 USM Configuration ---
+    # --- Configure SNMPv3 User Security Model (USM) ---
     config.addV3User(
         snmp_engine,
         userName=args.snmp_user,
@@ -128,46 +174,64 @@ async def main():
         privKey=args.priv_key,
     )
 
-    # --- Transport Endpoint ---
+    # --- Configure Network Transport ---
+    # Listen on the specified IP address and port.
     listen_address = (args.agent_address, args.agent_port)
     config.addTransport(
         snmp_engine,
-        udp.domainName,
+        udp.domainName,  # The transport domain for UDP
         udp.UdpTransport().openServerMode(listen_address)
     )
 
-    # --- MIB and Instrumentation Setup ---
+    # --- Build the MIB and Register OIDs ---
+    # MibBuilder is the container for all MIB objects.
+    # MibInstrumController links the MIB to live data sources.
     mib_builder = builder.MibBuilder()
     mib_instrum = instrum.MibInstrumController(mib_builder)
 
-    for oid, (nut_var, snmp_type_str, *converter) in OID_MAP.items():
-        oid_tuple = tuple(int(x) for x in oid.split('.'))
-        snmp_type_class = SNMP_TYPE_MAP[snmp_type_str]
-        converter_func = converter[0] if converter else None
-        ScalarInstanceClass = make_mib_scalar_instance(nut_var, snmp_type_class, converter_func)
-        mib_builder.exportSymbols('__MY_MIB', ScalarInstanceClass(oid_tuple, snmp_type_class()))
+    # Dynamically create and register a MibScalarInstance for each OID in our map.
+    for oid_str, (nut_var, snmp_class, *converter_func) in OID_TO_NUT_MAP.items():
+        oid_tuple = tuple(int(x) for x in oid_str.split('.'))
+        converter = converter_func[0] if converter_func else None
 
-    # --- SNMP Context and Command Responder ---
-    snmp_context = context.SnmpContext(snmp_engine)
-    cmdrsp.GetCommandResponder(snmp_engine, snmp_context)
-    cmdrsp.NextCommandResponder(snmp_engine, snmp_context)
+        # Create the specialized class for this OID using our factory.
+        ScalarInstanceClass = create_mib_scalar_instance(nut_var, snmp_class(), converter)
+
+        # Register this new class with the MIB instrumentation controller.
+        mib_builder.exportSymbols(
+            '__LOCAL_NUT_MIB',  # An arbitrary, internal MIB name
+            ScalarInstanceClass(oid_tuple, snmp_class())
+        )
+
+    # --- Register Command Responders and MIB View ---
+    # These responders handle incoming GET, GETNEXT, and GETBULK requests.
+    cmdrsp.GetCommandResponder(snmp_engine, context.SnmpContext(snmp_engine))
+    cmdrsp.NextCommandResponder(snmp_engine, context.SnmpContext(snmp_engine))
+    cmdrsp.BulkCommandResponder(snmp_engine, context.SnmpContext(snmp_engine))
+
+    # Link the MIB instrumentation to the default SNMP context.
     config.addContext(snmp_engine, '', mib_instrum)
 
-    # --- Run the Agent ---
-    logging.info(f"Starting SNMP agent at {listen_address} for user '{args.snmp_user}'...")
-    snmp_engine.transportDispatcher.jobStarted(1)
+    # --- Start the Agent ---
+    log.info(f"Agent starting. Listening on udp:{args.agent_address}:{args.agent_port}")
+    log.info(f"Configured for SNMPv3 user: '{args.snmp_user}'")
+
+    snmp_engine.transportDispatcher.jobStarted(1)  # Signal that the engine is ready.
 
     try:
-        # Keep the script running indefinitely
+        # Run the asyncio event loop forever.
         await asyncio.Event().wait()
     except (KeyboardInterrupt, asyncio.CancelledError):
-        logging.info("Shutdown request received.")
+        log.info("Shutdown signal received.")
     finally:
-        logging.info("Shutting down SNMP agent.")
+        log.info("Shutting down agent...")
         snmp_engine.transportDispatcher.closeDispatcher()
+        log.info("Agent stopped.")
+
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        logging.info("Agent stopped by user.")
+    except Exception as e:
+        log.critical(f"A critical error occurred in the main event loop: {e}")
+        sys.exit(1)
