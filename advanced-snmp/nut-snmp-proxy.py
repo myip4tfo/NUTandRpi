@@ -13,9 +13,11 @@ try:
     from pysnmp.entity import engine, config
     from pysnmp.entity.rfc3413 import cmdrsp, context
     from pysnmp.carrier.asyncio.dgram import udp
-    from pysnmp.smi import builder, instrum, rfc1902
+    from pysnmp.smi import builder, instrum
     # Import the `univ` module from pyasn1 for base ASN.1 types
     from pyasn1.type import univ
+    # Import the specific SNMP data types from their new MIB location
+    from pysnmp.smi.mibs.SNMPv2_SMI import Integer32, Gauge32
 except ImportError as e:
     print(f"Error: Failed to import pysnmp or pyasn1 library: {e}", file=sys.stderr)
     print("Please ensure pysnmp is installed in the virtual environment.", file=sys.stderr)
@@ -32,7 +34,6 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO,
 def get_upsc_value(var):
     """
     Runs upsc and returns the value for a given variable. Returns None on error.
-    This is a blocking call, but upsc is typically fast enough not to cause issues.
     """
     try:
         result = subprocess.run(['/bin/upsc', NUT_UPS_NAME, var],
@@ -81,8 +82,8 @@ OID_MAP = {
 # Correct mapping for modern pysnmp/pyasn1
 SNMP_TYPE_MAP = {
     'STRING': univ.OctetString,
-    'INTEGER': rfc1902.Integer32,
-    'GAUGE': rfc1902.Gauge32,
+    'INTEGER': Integer32,
+    'GAUGE': Gauge32,
 }
 
 # --- MIB Instrumentation ---
@@ -129,7 +130,6 @@ async def main():
 
     # --- Transport Endpoint ---
     listen_address = (args.agent_address, args.agent_port)
-    # The pysnmp engine will use the asyncio event loop by default
     config.addTransport(
         snmp_engine,
         udp.domainName,
@@ -155,10 +155,10 @@ async def main():
 
     # --- Run the Agent ---
     logging.info(f"Starting SNMP agent at {listen_address} for user '{args.snmp_user}'...")
-    snmp_engine.transportDispatcher.jobStarted(1)  # Mark dispatcher as active
+    snmp_engine.transportDispatcher.jobStarted(1)
 
     try:
-        # Keep the script running
+        # Keep the script running indefinitely
         await asyncio.Event().wait()
     except (KeyboardInterrupt, asyncio.CancelledError):
         logging.info("Shutdown request received.")
