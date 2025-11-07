@@ -19,7 +19,7 @@ try:
     from pysnmp.entity import engine, config
     from pysnmp.entity.rfc3413 import cmdrsp, context
     from pysnmp.carrier.asyncio.dgram import udp
-    from pysnmp.smi import builder, instrum, rfc1902
+    from pysnmp.smi import builder, instrum
 
     # The base ASN.1 types like OctetString are in the `pyasn1` dependency.
     from pyasn1.type import univ
@@ -46,7 +46,7 @@ mib_builder = builder.MibBuilder()
 
 # --- Agent Configuration ---
 NUT_UPS_NAME = "nutdev1@localhost"
-AGENT_VERSION = "3.0.0" # Major rewrite
+AGENT_VERSION = "4.1.0" # Final corrected version
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -113,26 +113,26 @@ OID_TO_NUT_MAP = {
     "1.3.6.1.2.1.33.1.4.4.1.5.1": ("ups.load", Gauge32),
 }
 
+# This class provides the dynamic data fetching behavior for our MIB objects.
 class NutMibScalar(MibScalar):
-    """A custom MibScalar that fetches its value from NUT."""
     def __init__(self, name, syntax, nut_variable, converter=None):
         super().__init__(name, syntax)
-        self.nut_variable = nut_variable
-        self.converter = converter
+        self._nut_variable = nut_variable
+        self._converter = converter
 
-    def getValue(self, name, idx):
-        raw_value = get_upsc_value(self.nut_variable)
+    def readGet(self, name, val, idx, acInfo):
+        raw_value = get_upsc_value(self._nut_variable)
 
         if raw_value is None:
-            log.warning(f"Returning default value for {self.nut_variable} as upsc fetch failed.")
-            return self.syntax.clone('' if issubclass(self.syntax.__class__, univ.OctetString) else 0)
+            log.warning(f"Returning default value for {self._nut_variable} as upsc fetch failed.")
+            return name, self.syntax.clone('' if issubclass(self.syntax.__class__, univ.OctetString) else 0)
 
         try:
-            final_value = self.converter(raw_value) if self.converter else raw_value
-            return self.syntax.clone(final_value)
+            final_value = self._converter(raw_value) if self._converter else raw_value
+            return name, self.syntax.clone(final_value)
         except (ValueError, TypeError) as e:
-            log.error(f"Failed to process value '{raw_value}' for {self.nut_variable}. Error: {e}")
-            return self.syntax.clone('' if issubclass(self.syntax.__class__, univ.OctetString) else 0)
+            log.error(f"Failed to process value '{raw_value}' for {self._nut_variable}. Error: {e}")
+            return name, self.syntax.clone('' if issubclass(self.syntax.__class__, univ.OctetString) else 0)
 
 async def main():
     """The main entry point for the SNMP agent."""
@@ -167,19 +167,20 @@ async def main():
         udp.UdpTransport().open_server_mode(listen_address)
     )
 
+    # This controller holds all the MIB object data
     mib_instrum = instrum.MibInstrumController(mib_builder)
 
+    # Create and export each MIB scalar object to the MIB builder
     for oid_str, (nut_var, snmp_class, *converter_func) in OID_TO_NUT_MAP.items():
         oid_tuple = tuple(int(x) for x in oid_str.split('.'))
         converter = converter_func[0] if converter_func else None
-        mib_builder.export_symbols(
-             '__LOCAL_NUT_MIB',
-             NutMibScalar(oid_tuple, snmp_class(), nut_var, converter)
-        )
+        mib_scalar = NutMibScalar(oid_tuple, snmp_class(), nut_var, converter)
+        mib_builder.export_symbols('__LOCAL_NUT_MIB', mib_scalar)
 
-    snmp_context = context.SnmpContext(snmp_engine)
-    snmp_context.registerContextName('', mib_instrum)
-    
+    # This context object links the SNMP engine with our MIB data
+    snmp_context = context.SnmpContext(snmp_engine, mib_instrum)
+
+    # These responders handle incoming requests, using the context we just created
     cmdrsp.GetCommandResponder(snmp_engine, snmp_context)
     cmdrsp.NextCommandResponder(snmp_engine, snmp_context)
     cmdrsp.BulkCommandResponder(snmp_engine, snmp_context)
